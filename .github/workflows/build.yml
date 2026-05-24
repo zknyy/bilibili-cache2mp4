@@ -62,23 +62,55 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
       - name: Set release tag and name
         run: |
           timestamp=$(date -u +'%Y%m%d%H%M%S')
           echo "RELEASE_TAG=v${timestamp}" >> $GITHUB_ENV
           echo "RELEASE_NAME=Release ${timestamp}" >> $GITHUB_ENV
 
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Create GitHub release and upload executables
+      - name: Create GitHub release
+        id: create_release
+        uses: actions/create-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ env.RELEASE_TAG }}
-          RELEASE_NAME: ${{ env.RELEASE_NAME }}
-        run: |
-          files=$(find artifacts -type f | tr '\n' ' ')
-          echo "Uploading release ${RELEASE_TAG} with files: $files"
-          gh release create "$RELEASE_TAG" $files --title "$RELEASE_NAME" --notes "Automated release created on push to main."
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          release_name: ${{ env.RELEASE_NAME }}
+          body: "Automated release created on push to main."
+          draft: false
+          prerelease: false
+
+      - name: Upload Linux executable
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/bilibili-cache2mp4-ubuntu-latest/run-dir-all
+          asset_name: run-dir-all-ubuntu
+          asset_content_type: application/octet-stream
+
+      - name: Upload macOS executable
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/bilibili-cache2mp4-macos-latest/run-dir-all
+          asset_name: run-dir-all-macos
+          asset_content_type: application/octet-stream
+
+      - name: Upload Windows executable
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/bilibili-cache2mp4-windows-latest/run-dir-all.exe
+          asset_name: run-dir-all-windows.exe
+          asset_content_type: application/octet-stream
