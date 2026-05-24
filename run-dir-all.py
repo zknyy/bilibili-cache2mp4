@@ -6,6 +6,8 @@ import argparse
 import subprocess
 import shutil
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
 
 # ---------- 文件名安全处理 ----------
 def sanitize_filename(name: str) -> str:
@@ -145,10 +147,58 @@ def process_m4s_files(work_dir: Path, target_dir: Path, raise_on_error: bool = T
             sys.exit(1)
         return False
 
-# ---------- 批量处理辅助 ----------
-def process_directories(directories, target_dir, raise_on_error=False):
+# ---------- 并行处理辅助 ----------
+def get_optimal_thread_count(num_dirs: int) -> int:
     """
-    处理多个目录，失败时记录错误并继续。
+    计算线程数：
+        - 最少 1
+        - 最多为 CPU 逻辑核心数的 3/4 向下取整，并且不能超过需要处理的目录数量
+    """
+    cpu_count = multiprocessing.cpu_count()
+    max_by_cpu = max(1, int(cpu_count * 3 / 4))
+    return max(1, min(max_by_cpu, num_dirs))
+
+def process_directories_parallel(directories, target_dir):
+    """
+    使用多线程并行处理多个目录。
+    返回 (成功数, 失败数, 失败列表)
+    """
+    if not directories:
+        return 0, 0, []
+    
+    # 过滤出有效目录
+    valid_dirs = [d for d in directories if d.is_dir()]
+    if not valid_dirs:
+        return 0, 0, []
+    
+    thread_count = get_optimal_thread_count(len(valid_dirs))
+    print(f"使用 {thread_count} 个线程并行处理 {len(valid_dirs)} 个目录...")
+    
+    success = 0
+    failures = []
+    with ThreadPoolExecutor(max_workers=thread_count) as executor:
+        future_to_dir = {
+            executor.submit(process_m4s_files, d, target_dir, False): d
+            for d in valid_dirs
+        }
+        for future in as_completed(future_to_dir):
+            d = future_to_dir[future]
+            try:
+                ok = future.result()
+                if ok:
+                    success += 1
+                else:
+                    failures.append(str(d))
+            except Exception as e:
+                print(f"处理目录 {d} 时线程异常：{e}")
+                failures.append(str(d))
+    
+    return success, len(failures), failures
+
+# ---------- 同步处理（用于单参数，保持原行为）----------
+def process_directories_sync(directories, target_dir):
+    """
+    同步逐个处理多个目录，失败时继续。
     返回 (成功数, 失败数, 失败列表)
     """
     success = 0
@@ -169,27 +219,44 @@ def process_directories(directories, target_dir, raise_on_error=False):
 
 # ---------- 主程序 ----------
 def main():
-    # 显示提示信息（需求1）
-    print("此文件默认在 B 站（bilibili.com）缓存目录中执行，")
-    print("会将缓存到本地的视频的 .m4s 文件处理并转换为可播放的 mp4 文件。")
-    print("支持单个转换（一个或多个目录名称作为参数）和所有都一起转换（没有目录名称作为参数）\n")
+    # 显示提示信息（包含多线程说明）
+    print("此文件用于将 B 站（bilibili.com）本地缓存的 .m4s 文件转换为可播放的 mp4 文件。")
+    print("处理逻辑：")
+    print("  1. 在每个缓存目录中找到两个 .m4s 文件（视频流和音频流），删除其前 9 字节头部；")
+    print("  2. 调用 ffmpeg 合并为 output.mp4；")
+    print("  3. 根据 videoInfo.json 中的 tabName 和 up 主名称生成最终文件名；")
+    print("  4. 将 mp4 文件移动到脚本执行目录。")
+    print("\n多线程支持：")
+    print("  - 当处理多个目录时（无参数自动扫描数字目录，或显式传入多个目录参数），")
+    print("    会使用多线程并行转换，大幅提升速度。")
+    print("  - 线程数自动设置为 CPU 逻辑核心数的 3/4（向下取整），同时不超过待处理目录总数。")
+    print("  - 单目录模式（仅传入一个参数）保持原有的同步处理行为，便于调试。\n")
 
     parser = argparse.ArgumentParser(
-        description="删除两个 .m4s 文件的前9字节，分别保存为 audio.m4s 和 video.m4s，"
-                    "然后用 ffmpeg 合并为 mp4，并根据 videoInfo.json 中的标题和 UP 主命名，"
-                    "最后移动到当前目录。"
+        description="B站缓存视频转换工具 - 将 .m4s 分段转换为标准 mp4 文件，支持单目录和多目录并行处理。",
+        epilog="示例：\n"
+               "  %(prog)s                     # 自动扫描当前目录下所有数字命名的子目录，询问后并行转换\n"
+               "  %(prog)s 12345               # 只处理目录 12345（同步模式）\n"
+               "  %(prog)s 12345 67890         # 并行处理两个指定目录\n"
+               "  %(prog)s /path/to/cache/dir  # 处理指定路径（同步模式）\n"
+               "  %(prog)s --help              # 显示本帮助信息",
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
         "directories",
         nargs="*",
-        help="一个或多个包含两个 .m4s 文件的目录路径（若提供多个，则逐个处理；若不提供，则处理当前目录下所有数字命名的子目录）"
+        help="一个或多个包含两个 .m4s 文件的目录路径。\n"
+             "• 如果不提供任何目录，将自动搜索当前目录下所有纯数字子目录（B站缓存目录特征），\n"
+             "  并询问用户是否进行并行转换。\n"
+             "• 如果提供一个目录，使用同步模式（传统行为），出错即退出。\n"
+             "• 如果提供多个目录，使用多线程并行处理，单个目录失败不影响其他。"
     )
     args = parser.parse_args()
 
     target_dir = Path.cwd()          # 最终 mp4 存放目录（当前工作目录）
     dir_list = args.directories
 
-    # 情况1：没有参数 -> 寻找所有数字命名的子目录，询问用户后处理
+    # 情况1：没有参数 -> 寻找所有数字命名的子目录，询问用户后处理（使用多线程）
     if len(dir_list) == 0:
         # 列出当前目录下所有纯数字子目录
         all_subdirs = [p for p in Path.cwd().iterdir() if p.is_dir() and p.name.isdigit()]
@@ -206,8 +273,8 @@ def main():
             print("用户取消操作。")
             sys.exit(0)
 
-        # 批量处理（失败继续）
-        success, fail_cnt, fail_list = process_directories(all_subdirs, target_dir, raise_on_error=False)
+        # 并行处理
+        success, fail_cnt, fail_list = process_directories_parallel(all_subdirs, target_dir)
         print(f"\n批量处理完成：成功 {success} 个，失败 {fail_cnt} 个。")
         if fail_cnt > 0:
             print("失败的目录：")
@@ -216,7 +283,7 @@ def main():
         sys.exit(0)
 
     # 情况2：有一个或多个参数
-    # 如果是单参数，保持原行为（出错立即退出）
+    # 如果是单参数，保持原行为（出错立即退出，不使用多线程）
     if len(dir_list) == 1:
         work_dir = Path(dir_list[0]).resolve()
         if not work_dir.is_dir():
@@ -225,7 +292,7 @@ def main():
         # 单个目录时 raise_on_error=True，出错会直接 sys.exit
         process_m4s_files(work_dir, target_dir, raise_on_error=True)
     else:
-        # 多个参数，逐个处理，失败不中断
+        # 多个参数，逐个验证有效性，然后并行处理
         valid_dirs = []
         for d in dir_list:
             p = Path(d).resolve()
@@ -236,7 +303,7 @@ def main():
         if not valid_dirs:
             print("没有有效的目录可处理。")
             sys.exit(1)
-        success, fail_cnt, fail_list = process_directories(valid_dirs, target_dir, raise_on_error=False)
+        success, fail_cnt, fail_list = process_directories_parallel(valid_dirs, target_dir)
         print(f"\n处理完成：成功 {success} 个，失败 {fail_cnt} 个。")
         if fail_cnt > 0:
             print("失败的目录：")
