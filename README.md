@@ -6,7 +6,7 @@
 - 绿色环保：无需安装，开源免费
 - 只需一个文件：`run-dir-all.py`
 - 其实还需要一个文件：[ffmpeg](https://ffmpeg.org/)
-- Python 3，多平台/系统兼容：在Windows，Linux，MacOS的Python环境中运行
+- 多平台/系统兼容：在Windows，Ubuntu，MacOS上直接运行，下载可执行文件：[Releases](https://github.com/zknyy/bilibili-cache2mp4/releases)
 
 ## 文件说明
 
