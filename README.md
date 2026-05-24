@@ -1,8 +1,14 @@
 # bilibili-cache2mp4
 
-将 B 站（bilibili.com）本地缓存的 `.m4s` 视频/音频片段转换为可播放的 `mp4` 文件。
+将 B 站（bilibili.com）本地缓存的 `.m4s` 视频/音频片段转换为可播放的 `mp4` 文件。 有以下特点：
+- 操作简单：一行命令搞定所有转换
+- 速度快：多线程加速，转换非常快
+- 绿色环保：无需安装，开源免费
+- 只需一个文件：`run-dir-all.py`
+- 其实还需要一个文件：[ffmpeg](https://ffmpeg.org/)
+- Python 3，多平台/系统兼容：在Windows，Linux，MacOS的Python环境中运行
 
-## 目录说明
+## 文件说明
 
 - `run-dir.py`
   - 在指定目录中查找两个原始 `.m4s` 文件（排除已经生成的 `audio.m4s` 和 `video.m4s`）
