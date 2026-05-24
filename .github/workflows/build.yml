@@ -68,10 +68,11 @@ jobs:
       - name: Create GitHub release
         id: create_release
         uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           release_name: ${{ env.RELEASE_NAME }}
           body: "Automated release created on push to main."
           draft: false
           prerelease: false
-          token: ${{ secrets.GITHUB_TOKEN }}
