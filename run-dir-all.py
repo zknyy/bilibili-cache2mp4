@@ -139,6 +139,16 @@ def process_m4s_files(work_dir: Path, target_dir: Path, raise_on_error: bool = T
         final_path = unique_filepath(target_dir, base_name, ".mp4")
         shutil.move(str(output_mp4), str(final_path))
         print(f"已移动并重命名：{final_path}")
+
+        # 5. 删除临时文件
+        for temp_file in (audio_path, video_path):
+            try:
+                if temp_file.exists():
+                    temp_file.unlink()
+                    print(f"已删除临时文件：{temp_file.name}")
+            except Exception as e:
+                print(f"警告：删除临时文件 {temp_file.name} 失败：{e}")
+
         return True
 
     except Exception as e:
