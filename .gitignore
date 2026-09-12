@@ -1,0 +1,34 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- PyInstaller 构建产物（见 .github/workflows/build.yml）----------
+build/
+dist/
+*.spec
+
+# ---------- 本工具的运行产物 ----------
+# 在仓库目录下直接运行脚本时会生成这些文件，体积可能很大，不应提交
+*.mp4
+audio.m4s
+video.m4s
+
+# ---------- 编辑器 / IDE ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---------- 操作系统 ----------
+.DS_Store
+Thumbs.db
+desktop.ini
