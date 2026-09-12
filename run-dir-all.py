@@ -6,6 +6,7 @@ import struct
 import argparse
 import subprocess
 import shutil
+import threading
 from pathlib import Path
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -40,45 +41,58 @@ CONTAINER_BOXES = frozenset({
 MAX_BOX_DEPTH = 8
 
 
-def _find_handler_type(fp, start, end, depth=0):
-    """在 [start, end) 的 box 范围内递归查找 hdlr 的 handler_type。"""
+def _collect_media_info(fp, start, end, info, depth=0):
+    """递归遍历 [start, end) 的 box，收集各 hdlr 的 handler_type 与 mvhd 时长。"""
     if depth > MAX_BOX_DEPTH:
-        return None
+        return
     offset = start
     while offset + 8 <= end:
         fp.seek(offset)
         header = fp.read(8)
         if len(header) < 8:
-            return None
+            return
         size = struct.unpack(">I", header[:4])[0]
         box_type = header[4:8].decode("latin-1", "replace")
         header_size = 8
         if size == 1:                      # 64 位长度
             extra = fp.read(8)
             if len(extra) < 8:
-                return None
+                return
             size = struct.unpack(">Q", extra)[0]
             header_size = 16
         elif size == 0:                    # 一直延伸到文件末尾
             size = end - offset
         if size < header_size or offset + size > end:
-            return None                    # 结构异常，放弃判定
+            return                         # 结构异常，放弃后续解析
         if box_type == "hdlr":
             payload = fp.read(min(12, size - header_size))
             if len(payload) >= 12:
                 # hdlr 布局：version+flags(4) + pre_defined(4) + handler_type(4)
-                return payload[8:12].decode("latin-1", "replace")
-            return None
+                info["handlers"].append(payload[8:12].decode("latin-1", "replace"))
+        elif box_type == "mvhd":
+            # mvhd 布局（version+flags 之后）：
+            #   v0 -> creation(4) modification(4) timescale(4) duration(4)
+            #   v1 -> creation(8) modification(8) timescale(4) duration(8)
+            payload = fp.read(min(32, size - header_size))
+            if len(payload) >= 20:
+                if payload[0] == 1 and len(payload) >= 32:
+                    timescale = struct.unpack(">I", payload[20:24])[0]
+                    duration = struct.unpack(">Q", payload[24:32])[0]
+                else:
+                    timescale = struct.unpack(">I", payload[12:16])[0]
+                    duration = struct.unpack(">I", payload[16:20])[0]
+                if timescale > 0:
+                    info["duration"] = duration / timescale
         if box_type in CONTAINER_BOXES:
-            found = _find_handler_type(fp, offset + header_size, offset + size, depth + 1)
-            if found:
-                return found
+            _collect_media_info(fp, offset + header_size, offset + size, info, depth + 1)
         offset += size
-    return None
 
 
-def detect_media_kind(path):
-    """判断 .m4s 是视频流还是音频流，返回 'video' / 'audio' / None（无法判定）。"""
+def probe_mp4(path):
+    """
+    解析 MP4/m4s 的结构，返回 {"handlers": [...], "duration": 秒 或 None}。
+    无法解析时 handlers 为空列表。同时兼容已剥头的文件与 B站原始缓存文件。
+    """
     try:
         end = path.stat().st_size
         with open(path, "rb") as fp:
@@ -86,14 +100,101 @@ def detect_media_kind(path):
             for start in (0, BILIBILI_PREFIX_BYTES):
                 if start >= end:
                     continue
-                handler = _find_handler_type(fp, start, end)
-                if handler == "vide":
-                    return "video"
-                if handler == "soun":
-                    return "audio"
+                candidate = {"handlers": [], "duration": None}
+                _collect_media_info(fp, start, end, candidate)
+                if candidate["handlers"]:
+                    return candidate
+    except OSError:
+        pass
+    return {"handlers": [], "duration": None}
+
+
+def detect_media_kind(path):
+    """判断 .m4s 是视频流还是音频流，返回 'video' / 'audio' / None（无法判定）。"""
+    handlers = probe_mp4(path)["handlers"]
+    if not handlers:
+        return None
+    first = handlers[0]
+    if first == "vide":
+        return "video"
+    if first == "soun":
+        return "audio"
+    return None
+
+
+# ---------- 已存在输出文件的校验（避免重复生成）----------
+MIN_VALID_MP4_BYTES = 1024          # 小于此体积必定不是完整视频
+DURATION_TOLERANCE_SECONDS = 3.0    # 与 videoInfo.json 时长的允许偏差（秒）
+DURATION_TOLERANCE_RATIO = 0.03     # 或按时长比例，取两者中较大的一个
+
+
+def _box_layout_complete(fp, end):
+    """
+    检查顶层 box 是否恰好铺满整个文件。
+
+    被截断的 mp4 仅靠 moov（位于文件开头）是发现不了的——它的流信息和时长都
+    还读得到，但最后一个 box 声明的长度会超出文件末尾，这里就是凭这一点识破。
+    """
+    offset = 0
+    while offset + 8 <= end:
+        fp.seek(offset)
+        header = fp.read(8)
+        if len(header) < 8:
+            return False
+        size = struct.unpack(">I", header[:4])[0]
+        header_size = 8
+        if size == 1:                      # 64 位长度
+            extra = fp.read(8)
+            if len(extra) < 8:
+                return False
+            size = struct.unpack(">Q", extra)[0]
+            header_size = 16
+        elif size == 0:                    # 延伸到文件末尾，视为完整
+            size = end - offset
+        if size < header_size or offset + size > end:
+            return False                   # 声明长度越过文件末尾 → 被截断
+        offset += size
+    return offset == end
+
+
+def check_existing_output(path: Path, expected_duration=None):
+    """
+    检查目标位置上已存在的文件是否完好，返回值：
+        None        - 文件不存在
+        'valid'     - 是完整的 mp4：体积正常、结构完整、含视频流与音频流，
+                      且时长与预期相符
+        'invalid'   - 存在但不是完整 mp4（体积过小、被截断、结构损坏、缺少音视频流）
+        'different' - 是完好的 mp4，但时长与预期明显不符（同名却是另一个视频）
+    """
+    try:
+        if not path.is_file():
+            return None
+        size = path.stat().st_size
     except OSError:
         return None
-    return None
+
+    if size < MIN_VALID_MP4_BYTES:
+        return "invalid"               # 空文件或半成品
+
+    try:
+        with open(path, "rb") as fp:
+            if not _box_layout_complete(fp, size):
+                return "invalid"       # 被截断或结构损坏
+    except OSError:
+        return None
+
+    info = probe_mp4(path)
+    handlers = info["handlers"]
+    if "vide" not in handlers or "soun" not in handlers:
+        return "invalid"               # 缺流：被截断或压根不是视频
+
+    duration = info["duration"]
+    if expected_duration and duration:
+        tolerance = max(DURATION_TOLERANCE_SECONDS,
+                        expected_duration * DURATION_TOLERANCE_RATIO)
+        if abs(duration - expected_duration) > tolerance:
+            return "different"
+    return "valid"
 
 
 def split_audio_video(files):
@@ -163,9 +264,15 @@ def flat_base_name(work_dir: Path, info) -> str:
 @dataclass
 class OutputPlan:
     """一个缓存目录的输出规划。"""
-    dest_dir: Path          # 最终存放 mp4 的目录
-    base_name: str          # 不含扩展名的文件名
-    series_dir: str = ""    # 系列目录名；为空表示该视频不属于多视频系列
+    dest_dir: Path                    # 最终存放 mp4 的目录
+    base_name: str                    # 不含扩展名的文件名
+    series_dir: str = ""              # 系列目录名；为空表示该视频不属于多视频系列
+    expected_duration: float = None   # videoInfo.json 声明的时长（秒），用于校验已有文件
+
+    @property
+    def planned_path(self) -> Path:
+        """预判的输出全路径（未考虑重名避让）。"""
+        return self.dest_dir / f"{self.base_name}.mp4"
 
 
 def build_output_plans(work_dirs, target_dir: Path):
@@ -197,6 +304,11 @@ def build_output_plans(work_dirs, target_dir: Path):
         info = infos[d]
         key = get_series_key(info)
         members = series_members.get(key, []) if key else []
+        duration = info.get("duration") if info else None
+        try:
+            duration = float(duration) if duration is not None else None
+        except (TypeError, ValueError):
+            duration = None
         if len(members) >= 2:
             # 系列目录名 = 系列名称-up主名称
             group_title = (info.get("groupTitle") or "").strip()
@@ -209,9 +321,9 @@ def build_output_plans(work_dirs, target_dir: Path):
             # 系列内的视频只用视频名称，不追加 up主名称
             tab_name = (info.get("tabName") or "").strip()
             base_name = sanitize_filename(tab_name) if tab_name else sanitize_filename(d.name)
-            plans[d] = OutputPlan(target_dir / series_dir, base_name, series_dir)
+            plans[d] = OutputPlan(target_dir / series_dir, base_name, series_dir, duration)
         else:
-            plans[d] = OutputPlan(target_dir, flat_base_name(d, info))
+            plans[d] = OutputPlan(target_dir, flat_base_name(d, info), "", duration)
     return plans
 
 
@@ -231,12 +343,24 @@ def describe_plans(plans, target_dir: Path):
         for series_dir in sorted(series_dirs):
             print(f"  {target_dir / series_dir}")
             for _, plan in sorted(series_dirs[series_dir], key=lambda x: x[1].base_name):
-                print(f"      {plan.base_name}.mp4")
+                print(f"      {plan.base_name}.mp4{describe_existing(plan)}")
     if singles:
         print(f"\n其余 {len(singles)} 个视频不属于多视频系列，直接输出到 {target_dir}：")
         for _, plan in sorted(singles, key=lambda x: x[1].base_name):
-            print(f"  {plan.base_name}.mp4")
+            print(f"  {plan.base_name}.mp4{describe_existing(plan)}")
     print()
+
+
+def describe_existing(plan: OutputPlan) -> str:
+    """预判目标位置已有文件的状态，用于在处理前提示是否会跳过。"""
+    status = check_existing_output(plan.planned_path, plan.expected_duration)
+    if status == "valid":
+        return "  [已存在且完好，跳过]"
+    if status == "invalid":
+        return "  [已存在但不完好，将覆盖重做]"
+    if status == "different":
+        return "  [同名文件是另一个视频，将另存为新名字]"
+    return ""
 
 def unique_filepath(target_dir: Path, base_name: str, ext: str = ".mp4") -> Path:
     """
@@ -250,20 +374,57 @@ def unique_filepath(target_dir: Path, base_name: str, ext: str = ".mp4") -> Path
         counter += 1
     return candidate
 
+
+# 并行处理时保护“定名 + 移动”这一步，避免同批次内同名文件互相覆盖
+_OUTPUT_LOCK = threading.Lock()
+
+
+def resolve_output(plan: OutputPlan):
+    """
+    生成前预判输出位置，返回 (planned_path, action)：
+        'skip'      - 目标文件已存在且校验通过，无需重新生成
+        'overwrite' - 目标文件存在但不完好（损坏/半成品），应原地覆盖重做
+        'avoid'     - 同名文件是另一个完好的视频，应改用带序号的新名字
+        'new'       - 目标位置空闲，直接使用 planned_path
+    """
+    planned = plan.planned_path
+    status = check_existing_output(planned, plan.expected_duration)
+    if status == "valid":
+        return planned, "skip"
+    if status == "invalid":
+        return planned, "overwrite"
+    if status == "different":
+        return planned, "avoid"
+    return planned, "new"
+
 # ---------- 核心处理函数 ----------
-def process_m4s_files(work_dir: Path, plan: OutputPlan, raise_on_error: bool = True) -> bool:
+def process_m4s_files(work_dir: Path, plan: OutputPlan, raise_on_error: bool = True) -> str:
     """
     在 work_dir 中处理两个 .m4s 文件，删除前9字节，合并为 mp4，
     并按 plan 指定的目录与文件名输出。
+
+    生成前会先预判目标文件：若已存在且校验通过（体积、音视频流、时长均正常），
+    则直接跳过，不重复生成。
+
     参数:
         work_dir: 包含原始 .m4s 和 videoInfo.json 的目录
         plan: OutputPlan，指定最终存放目录与文件名
-        raise_on_error: True 时出错调用 sys.exit；False 时返回 False 并继续
+        raise_on_error: True 时出错调用 sys.exit；False 时返回 'failed' 并继续
     返回:
-        bool: 成功返回 True，失败返回 False（仅在 raise_on_error=False 时有意义）
+        str: 'generated'（新生成）/ 'skipped'（已存在，跳过）/ 'failed'（失败）
     """
     # 统一错误处理包装
     try:
+        # 0. 预判输出位置：已存在且完好则跳过，避免重复生成
+        final_path, action = resolve_output(plan)
+        if action == "skip":
+            try:
+                size_mb = final_path.stat().st_size / 1024 / 1024
+            except OSError:
+                size_mb = 0.0
+            print(f"跳过：已存在且校验通过 {final_path} ({size_mb:.2f} MB)")
+            return "skipped"
+
         # 1. 检查 .m4s 文件数量
         m4s_files = [f for f in work_dir.glob("*.m4s") 
                      if f.name not in ("audio.m4s", "video.m4s")]
@@ -272,7 +433,7 @@ def process_m4s_files(work_dir: Path, plan: OutputPlan, raise_on_error: bool = T
             print(error_msg)
             if raise_on_error:
                 sys.exit(1)
-            return False
+            return "failed"
 
         # 按实际流类型分派音视频（不能用文件名排序推断）
         audio_src, video_src = split_audio_video(m4s_files)
@@ -313,17 +474,29 @@ def process_m4s_files(work_dir: Path, plan: OutputPlan, raise_on_error: bool = T
             print(result.stderr)
             if raise_on_error:
                 sys.exit(1)
-            return False
+            return "failed"
         print(f"ffmpeg 合并成功：{output_mp4}")
 
         # 4. 按规划输出：系列视频放进同名子目录，其余直接放到根目录
+        #    定名与移动放在同一把锁内，避免并行处理时同名文件互相覆盖
         plan.dest_dir.mkdir(parents=True, exist_ok=True)
-        final_path = unique_filepath(plan.dest_dir, plan.base_name, ".mp4")
-        full_path = str(final_path)
-        if len(full_path) > 250:
-            print(f"警告：输出路径长度 {len(full_path)} 字符，接近 Windows MAX_PATH(260) 限制，"
-                  f"若移动失败请改在更短的路径下运行。")
-        shutil.move(str(output_mp4), str(final_path))
+        with _OUTPUT_LOCK:
+            if action == "overwrite":
+                # 目标位置上的旧文件已确认不完好，删掉后原地重做
+                try:
+                    final_path.unlink()
+                    print(f"已删除不完好的旧文件：{final_path.name}")
+                except OSError as e:
+                    print(f"警告：删除旧文件 {final_path.name} 失败：{e}，改用新的文件名。")
+                    final_path = unique_filepath(plan.dest_dir, plan.base_name, ".mp4")
+            else:
+                # 'new' / 'avoid'：取一个当前空闲的名字（'avoid' 会拿到 _1 后缀）
+                final_path = unique_filepath(plan.dest_dir, plan.base_name, ".mp4")
+            full_path = str(final_path)
+            if len(full_path) > 250:
+                print(f"警告：输出路径长度 {len(full_path)} 字符，接近 Windows MAX_PATH(260) 限制，"
+                      f"若移动失败请改在更短的路径下运行。")
+            shutil.move(str(output_mp4), str(final_path))
         print(f"已移动并重命名：{final_path}")
 
         # 5. 删除临时文件
@@ -335,13 +508,13 @@ def process_m4s_files(work_dir: Path, plan: OutputPlan, raise_on_error: bool = T
             except Exception as e:
                 print(f"警告：删除临时文件 {temp_file.name} 失败：{e}")
 
-        return True
+        return "generated"
 
     except Exception as e:
         print(f"处理目录 {work_dir} 时发生未预期异常：{e}")
         if raise_on_error:
             sys.exit(1)
-        return False
+        return "failed"
 
 # ---------- 并行处理辅助 ----------
 def get_optimal_thread_count(num_dirs: int) -> int:
@@ -357,15 +530,15 @@ def get_optimal_thread_count(num_dirs: int) -> int:
 def process_directories_parallel(directories, target_dir):
     """
     使用多线程并行处理多个目录。
-    返回 (成功数, 失败数, 失败列表)
+    返回 (新生成数, 跳过数, 失败数, 失败列表)
     """
     if not directories:
-        return 0, 0, []
+        return 0, 0, 0, []
     
     # 过滤出有效目录
     valid_dirs = [d for d in directories if d.is_dir()]
     if not valid_dirs:
-        return 0, 0, []
+        return 0, 0, 0, []
     
     thread_count = get_optimal_thread_count(len(valid_dirs))
     print(f"使用 {thread_count} 个线程并行处理 {len(valid_dirs)} 个目录...")
@@ -374,7 +547,8 @@ def process_directories_parallel(directories, target_dir):
     plans = build_output_plans(valid_dirs, target_dir)
     describe_plans(plans, target_dir)
 
-    success = 0
+    generated = 0
+    skipped = 0
     failures = []
     with ThreadPoolExecutor(max_workers=thread_count) as executor:
         future_to_dir = {
@@ -384,24 +558,28 @@ def process_directories_parallel(directories, target_dir):
         for future in as_completed(future_to_dir):
             d = future_to_dir[future]
             try:
-                ok = future.result()
-                if ok:
-                    success += 1
-                else:
-                    failures.append(str(d))
+                status = future.result()
             except Exception as e:
                 print(f"处理目录 {d} 时线程异常：{e}")
                 failures.append(str(d))
+                continue
+            if status == "generated":
+                generated += 1
+            elif status == "skipped":
+                skipped += 1
+            else:
+                failures.append(str(d))
     
-    return success, len(failures), failures
+    return generated, skipped, len(failures), failures
 
 # ---------- 同步处理（用于单参数，保持原行为）----------
 def process_directories_sync(directories, target_dir):
     """
     同步逐个处理多个目录，失败时继续。
-    返回 (成功数, 失败数, 失败列表)
+    返回 (新生成数, 跳过数, 失败数, 失败列表)
     """
-    success = 0
+    generated = 0
+    skipped = 0
     failures = []
     valid_dirs = []
     for d in directories:
@@ -417,12 +595,14 @@ def process_directories_sync(directories, target_dir):
 
     for work_dir in valid_dirs:
         print(f"\n>>> 正在处理目录：{work_dir}")
-        ok = process_m4s_files(work_dir, plans[work_dir], raise_on_error=False)
-        if ok:
-            success += 1
+        status = process_m4s_files(work_dir, plans[work_dir], raise_on_error=False)
+        if status == "generated":
+            generated += 1
+        elif status == "skipped":
+            skipped += 1
         else:
             failures.append(str(work_dir))
-    return success, len(failures), failures
+    return generated, skipped, len(failures), failures
 
 # ---------- 主程序 ----------
 def main():
@@ -433,6 +613,12 @@ def main():
     print("  2. 调用 ffmpeg 合并为 output.mp4；")
     print("  3. 根据 videoInfo.json 中的 tabName 和 up 主名称生成最终文件名；")
     print("  4. 将 mp4 文件移动到脚本执行目录。")
+    print("\n避免重复生成：")
+    print("  - 生成前先预判目标位置与文件名；")
+    print("  - 若该文件已存在且校验通过（体积正常、含视频流与音频流、时长与")
+    print("    videoInfo.json 相符），则直接跳过，不再重复转换；")
+    print("  - 已存在但校验不通过（损坏/半成品）时会覆盖重做；")
+    print("  - 同名文件若是另一个完好的视频，则另存为新名字，不会覆盖它。")
     print("\n系列视频处理：")
     print("  - 同一系列的多个视频（videoInfo.json 中 groupId 相同的缓存目录），")
     print("    会统一放进一个子目录，目录名为「系列名称-up主名称」；")
@@ -486,8 +672,9 @@ def main():
             sys.exit(0)
 
         # 并行处理
-        success, fail_cnt, fail_list = process_directories_parallel(all_subdirs, target_dir)
-        print(f"\n批量处理完成：成功 {success} 个，失败 {fail_cnt} 个。")
+        generated, skipped, fail_cnt, fail_list = process_directories_parallel(all_subdirs, target_dir)
+        print(f"\n批量处理完成：成功 {generated + skipped} 个"
+              f"（新生成 {generated}，跳过已存在 {skipped}），失败 {fail_cnt} 个。")
         if fail_cnt > 0:
             print("失败的目录：")
             for f in fail_list:
@@ -503,8 +690,9 @@ def main():
             sys.exit(1)
         # 单个目录时 raise_on_error=True，出错会直接 sys.exit
         # 单目录模式下本批次只有它自己，无法判断是否属于系列，因此维持原有命名
-        process_m4s_files(work_dir, build_output_plans([work_dir], target_dir)[work_dir],
-                          raise_on_error=True)
+        status = process_m4s_files(work_dir, build_output_plans([work_dir], target_dir)[work_dir],
+                                   raise_on_error=True)
+        print(f"\n处理完成：{'已跳过（文件已存在且完好）' if status == 'skipped' else '已生成'}。")
     else:
         # 多个参数，逐个验证有效性，然后并行处理
         valid_dirs = []
@@ -517,8 +705,9 @@ def main():
         if not valid_dirs:
             print("没有有效的目录可处理。")
             sys.exit(1)
-        success, fail_cnt, fail_list = process_directories_parallel(valid_dirs, target_dir)
-        print(f"\n处理完成：成功 {success} 个，失败 {fail_cnt} 个。")
+        success, skipped, fail_cnt, fail_list = process_directories_parallel(valid_dirs, target_dir)
+        print(f"\n处理完成：成功 {success + skipped} 个"
+              f"（新生成 {success}，跳过已存在 {skipped}），失败 {fail_cnt} 个。")
         if fail_cnt > 0:
             print("失败的目录：")
             for f in fail_list:
