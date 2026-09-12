@@ -7,6 +7,7 @@ import argparse
 import subprocess
 import shutil
 from pathlib import Path
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
 
@@ -107,37 +108,135 @@ def split_audio_video(files):
     ordered = sorted(files, key=lambda f: (f.stat().st_size, f.name))
     return ordered[0], ordered[1]
 
-def get_custom_name_from_video_info(work_dir: Path) -> str:
+# ---------- videoInfo.json 读取与输出规划 ----------
+UNKNOWN_UP_NAME = "未知UP主"
+
+
+def read_video_info(work_dir: Path):
     """
-    从 work_dir/videoInfo.json 中读取 tabName 和 uname，
-    拼接成 "tabName by uname" 格式，并过滤非法字符。
-    如果读取失败或字段为空，则返回 work_dir 的名称（即目录名）。
+    读取 work_dir/videoInfo.json，返回 dict；文件缺失或损坏时返回 None。
     """
     info_path = work_dir / "videoInfo.json"
     if not info_path.is_file():
-        print(f"警告：{info_path} 不存在，使用目录名作为文件名基础。")
-        return work_dir.name
-
+        return None
     try:
         with open(info_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        tab_name = data.get("tabName")
-        uname = data.get("uname")
-        # 处理 null 或空字符串
-        if not tab_name:
-            tab_name = ""
-        if not uname:
-            uname = "未知UP主"
-        if not tab_name:
-            # 如果没有 tabName，只用目录名
-            base = work_dir.name
-        else:
-            base = f"{tab_name} by {uname}"
-        base = sanitize_filename(base)
-        return base
+        return data if isinstance(data, dict) else None
     except Exception as e:
-        print(f"警告：读取 {info_path} 失败 ({e})，使用目录名作为文件名基础。")
-        return work_dir.name
+        print(f"警告：读取 {info_path} 失败 ({e})，将改用目录名。")
+        return None
+
+
+def get_series_key(info):
+    """
+    取视频所属系列的标识。B站把同一合集/多P视频的 groupId 设为相同值，
+    因此用 groupId 作为系列标识；缺失时退回 groupTitle。
+    返回 None 表示该视频无法归入任何系列。
+    """
+    if not info:
+        return None
+    group_id = (info.get("groupId") or "").strip()
+    if group_id:
+        return f"id:{group_id}"
+    group_title = (info.get("groupTitle") or "").strip()
+    if group_title:
+        return f"title:{group_title}"
+    return None
+
+
+def flat_base_name(work_dir: Path, info) -> str:
+    """
+    非系列视频的文件名基础："tabName by uname"；读不到 videoInfo.json 时退回目录名。
+    """
+    if not info:
+        print(f"警告：{work_dir / 'videoInfo.json'} 不可用，使用目录名作为文件名基础。")
+        return sanitize_filename(work_dir.name)
+    tab_name = (info.get("tabName") or "").strip()
+    uname = (info.get("uname") or "").strip() or UNKNOWN_UP_NAME
+    if not tab_name:
+        # 如果没有 tabName，只用目录名
+        return sanitize_filename(work_dir.name)
+    return sanitize_filename(f"{tab_name} by {uname}")
+
+
+@dataclass
+class OutputPlan:
+    """一个缓存目录的输出规划。"""
+    dest_dir: Path          # 最终存放 mp4 的目录
+    base_name: str          # 不含扩展名的文件名
+    series_dir: str = ""    # 系列目录名；为空表示该视频不属于多视频系列
+
+
+def build_output_plans(work_dirs, target_dir: Path):
+    """
+    为一整批缓存目录规划输出位置。
+
+    同一系列（videoInfo.json 中 groupId 相同）在本批次中出现 2 个及以上视频时，
+    这些视频统一放进 target_dir/{系列名称}-{up主名称}/ 子目录，文件名只用视频
+    名称（tabName）。其余视频维持原有行为：直接放在 target_dir，文件名为
+    "tabName by uname"。
+
+    参数:
+        work_dirs: 本批次要处理的缓存目录列表
+        target_dir: 最终 mp4 的根存放目录
+    返回:
+        dict: work_dir -> OutputPlan
+    """
+    infos = {d: read_video_info(d) for d in work_dirs}
+
+    # 统计每个系列在本批次中出现的视频数量
+    series_members = {}
+    for d in work_dirs:
+        key = get_series_key(infos[d])
+        if key:
+            series_members.setdefault(key, []).append(d)
+
+    plans = {}
+    for d in work_dirs:
+        info = infos[d]
+        key = get_series_key(info)
+        members = series_members.get(key, []) if key else []
+        if len(members) >= 2:
+            # 系列目录名 = 系列名称-up主名称
+            group_title = (info.get("groupTitle") or "").strip()
+            uname = (info.get("uname") or "").strip() or UNKNOWN_UP_NAME
+            if group_title:
+                series_dir = sanitize_filename(f"{group_title}-{uname}")
+            else:
+                # 没有系列名称时退化为 up主名称，保证仍能分组
+                series_dir = sanitize_filename(f"{uname}-合集")
+            # 系列内的视频只用视频名称，不追加 up主名称
+            tab_name = (info.get("tabName") or "").strip()
+            base_name = sanitize_filename(tab_name) if tab_name else sanitize_filename(d.name)
+            plans[d] = OutputPlan(target_dir / series_dir, base_name, series_dir)
+        else:
+            plans[d] = OutputPlan(target_dir, flat_base_name(d, info))
+    return plans
+
+
+def describe_plans(plans, target_dir: Path):
+    """打印本次批处理的输出规划，让系列分组一目了然。"""
+    series_dirs = {}
+    singles = []
+    for work_dir, plan in plans.items():
+        if plan.series_dir:
+            series_dirs.setdefault(plan.series_dir, []).append((work_dir, plan))
+        else:
+            singles.append((work_dir, plan))
+
+    if series_dirs:
+        total = sum(len(v) for v in series_dirs.values())
+        print(f"\n检测到 {len(series_dirs)} 个系列，共 {total} 个视频，各自放入独立目录：")
+        for series_dir in sorted(series_dirs):
+            print(f"  {target_dir / series_dir}")
+            for _, plan in sorted(series_dirs[series_dir], key=lambda x: x[1].base_name):
+                print(f"      {plan.base_name}.mp4")
+    if singles:
+        print(f"\n其余 {len(singles)} 个视频不属于多视频系列，直接输出到 {target_dir}：")
+        for _, plan in sorted(singles, key=lambda x: x[1].base_name):
+            print(f"  {plan.base_name}.mp4")
+    print()
 
 def unique_filepath(target_dir: Path, base_name: str, ext: str = ".mp4") -> Path:
     """
@@ -152,13 +251,13 @@ def unique_filepath(target_dir: Path, base_name: str, ext: str = ".mp4") -> Path
     return candidate
 
 # ---------- 核心处理函数 ----------
-def process_m4s_files(work_dir: Path, target_dir: Path, raise_on_error: bool = True) -> bool:
+def process_m4s_files(work_dir: Path, plan: OutputPlan, raise_on_error: bool = True) -> bool:
     """
     在 work_dir 中处理两个 .m4s 文件，删除前9字节，合并为 mp4，
-    并以 videoInfo.json 中的标题命名，移动到 target_dir。
+    并按 plan 指定的目录与文件名输出。
     参数:
         work_dir: 包含原始 .m4s 和 videoInfo.json 的目录
-        target_dir: 最终 mp4 文件存放的目录
+        plan: OutputPlan，指定最终存放目录与文件名
         raise_on_error: True 时出错调用 sys.exit；False 时返回 False 并继续
     返回:
         bool: 成功返回 True，失败返回 False（仅在 raise_on_error=False 时有意义）
@@ -217,9 +316,13 @@ def process_m4s_files(work_dir: Path, target_dir: Path, raise_on_error: bool = T
             return False
         print(f"ffmpeg 合并成功：{output_mp4}")
 
-        # 4. 生成自定义文件名并移动
-        base_name = get_custom_name_from_video_info(work_dir)
-        final_path = unique_filepath(target_dir, base_name, ".mp4")
+        # 4. 按规划输出：系列视频放进同名子目录，其余直接放到根目录
+        plan.dest_dir.mkdir(parents=True, exist_ok=True)
+        final_path = unique_filepath(plan.dest_dir, plan.base_name, ".mp4")
+        full_path = str(final_path)
+        if len(full_path) > 250:
+            print(f"警告：输出路径长度 {len(full_path)} 字符，接近 Windows MAX_PATH(260) 限制，"
+                  f"若移动失败请改在更短的路径下运行。")
         shutil.move(str(output_mp4), str(final_path))
         print(f"已移动并重命名：{final_path}")
 
@@ -266,12 +369,16 @@ def process_directories_parallel(directories, target_dir):
     
     thread_count = get_optimal_thread_count(len(valid_dirs))
     print(f"使用 {thread_count} 个线程并行处理 {len(valid_dirs)} 个目录...")
-    
+
+    # 先统一规划输出位置：同一系列的多个视频会被放进同一个子目录
+    plans = build_output_plans(valid_dirs, target_dir)
+    describe_plans(plans, target_dir)
+
     success = 0
     failures = []
     with ThreadPoolExecutor(max_workers=thread_count) as executor:
         future_to_dir = {
-            executor.submit(process_m4s_files, d, target_dir, False): d
+            executor.submit(process_m4s_files, d, plans[d], False): d
             for d in valid_dirs
         }
         for future in as_completed(future_to_dir):
@@ -296,14 +403,21 @@ def process_directories_sync(directories, target_dir):
     """
     success = 0
     failures = []
+    valid_dirs = []
     for d in directories:
         work_dir = Path(d).resolve()
         if not work_dir.is_dir():
             print(f"跳过无效目录：{d}")
             failures.append(str(d))
             continue
+        valid_dirs.append(work_dir)
+
+    plans = build_output_plans(valid_dirs, target_dir)
+    describe_plans(plans, target_dir)
+
+    for work_dir in valid_dirs:
         print(f"\n>>> 正在处理目录：{work_dir}")
-        ok = process_m4s_files(work_dir, target_dir, raise_on_error=False)
+        ok = process_m4s_files(work_dir, plans[work_dir], raise_on_error=False)
         if ok:
             success += 1
         else:
@@ -319,6 +433,11 @@ def main():
     print("  2. 调用 ffmpeg 合并为 output.mp4；")
     print("  3. 根据 videoInfo.json 中的 tabName 和 up 主名称生成最终文件名；")
     print("  4. 将 mp4 文件移动到脚本执行目录。")
+    print("\n系列视频处理：")
+    print("  - 同一系列的多个视频（videoInfo.json 中 groupId 相同的缓存目录），")
+    print("    会统一放进一个子目录，目录名为「系列名称-up主名称」；")
+    print("  - 系列内的视频文件只使用视频名称，不再追加 up 主名称；")
+    print("  - 系列内只有一个视频时不建子目录，其余视频也直接放在脚本执行目录。")
     print("\n多线程支持：")
     print("  - 当处理多个目录时（无参数自动扫描数字目录，或显式传入多个目录参数），")
     print("    会使用多线程并行转换，大幅提升速度。")
@@ -383,7 +502,9 @@ def main():
             print(f"错误：目录 '{work_dir}' 不存在或不是有效目录。")
             sys.exit(1)
         # 单个目录时 raise_on_error=True，出错会直接 sys.exit
-        process_m4s_files(work_dir, target_dir, raise_on_error=True)
+        # 单目录模式下本批次只有它自己，无法判断是否属于系列，因此维持原有命名
+        process_m4s_files(work_dir, build_output_plans([work_dir], target_dir)[work_dir],
+                          raise_on_error=True)
     else:
         # 多个参数，逐个验证有效性，然后并行处理
         valid_dirs = []
