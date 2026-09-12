@@ -12,8 +12,9 @@
 
 - `run-dir.py`
   - 在指定目录中查找两个原始 `.m4s` 文件（排除已经生成的 `audio.m4s` 和 `video.m4s`）
-  - 按文件名排序后分别删除每个文件的前 9 个字节
-  - 将处理后的文件保存为同目录下的 `audio.m4s` 和 `video.m4s`
+  - 读取每个 `.m4s` 的 MP4 box 结构，据此判断它是视频流还是音频流（不依赖文件名）
+  - 分别删除每个文件的前 9 个字节
+  - 将视频流保存为 `video.m4s`、音频流保存为 `audio.m4s`（同目录下）
 - `run-dir-all.py`
   - 处理逻辑与 `run-dir.py` 类似，先生成 `audio.m4s` 和 `video.m4s`
   - 再调用 [ffmpeg](https://ffmpeg.org/) 将音视频合并为 `output.mp4`
@@ -85,7 +86,8 @@ python run-dir-all.py 12345 67890
 ## 注意事项
 
 - 目标目录中必须恰好包含 2 个原始 `.m4s` 文件（排除 `audio.m4s` 和 `video.m4s`）
-- 脚本会按文件名排序后处理，较小名称的文件生成 `audio.m4s`，较大名称的文件生成 `video.m4s`
+- 脚本会读取文件内容判断流类型，因此 `audio.m4s` 一定是音频流、`video.m4s` 一定是视频流，与文件名无关
+- B 站缓存的文件名形如 `{cid}-{分P}-{流编号}.m4s`。流编号与音视频的对应关系随清晰度和编码变化（例如 `30080` 是视频、`30280` 是音频），**不能按文件名排序推断**，脚本也不会这样做
 - `run-dir-all.py` 依赖 [ffmpeg](https://ffmpeg.org/)，若未安装或未添加到 `PATH`，会提示错误并退出
 - `videoInfo.json` 中的标题会过滤非法文件名字符，确保生成的 MP4 名称可在 Windows / Linux / macOS 中使用
 

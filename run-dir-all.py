@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import re
+import struct
 import argparse
 import subprocess
 import shutil
@@ -25,6 +26,86 @@ def sanitize_filename(name: str) -> str:
     if not name:
         name = "output"
     return name
+
+# ---------- 音视频流识别 ----------
+# B站缓存的文件名形如 {cid}-{分P}-{流编号}.m4s，但流编号与音视频的对应关系会随
+# 清晰度和编码变化（实测 30080 是视频、30280 是音频），所以不能靠文件名排序来
+# 推断哪个文件是音频。这里直接读取 MP4 的 box 结构，用 moov/trak/mdia 下 hdlr
+# 的 handler_type 判断真实流类型：不依赖文件名，也不需要 ffmpeg。
+BILIBILI_PREFIX_BYTES = 9          # B站缓存文件头部的垃圾字节数
+CONTAINER_BOXES = frozenset({
+    "moov", "trak", "mdia", "minf", "stbl", "edts", "mvex", "dinf", "udta",
+})
+MAX_BOX_DEPTH = 8
+
+
+def _find_handler_type(fp, start, end, depth=0):
+    """在 [start, end) 的 box 范围内递归查找 hdlr 的 handler_type。"""
+    if depth > MAX_BOX_DEPTH:
+        return None
+    offset = start
+    while offset + 8 <= end:
+        fp.seek(offset)
+        header = fp.read(8)
+        if len(header) < 8:
+            return None
+        size = struct.unpack(">I", header[:4])[0]
+        box_type = header[4:8].decode("latin-1", "replace")
+        header_size = 8
+        if size == 1:                      # 64 位长度
+            extra = fp.read(8)
+            if len(extra) < 8:
+                return None
+            size = struct.unpack(">Q", extra)[0]
+            header_size = 16
+        elif size == 0:                    # 一直延伸到文件末尾
+            size = end - offset
+        if size < header_size or offset + size > end:
+            return None                    # 结构异常，放弃判定
+        if box_type == "hdlr":
+            payload = fp.read(min(12, size - header_size))
+            if len(payload) >= 12:
+                # hdlr 布局：version+flags(4) + pre_defined(4) + handler_type(4)
+                return payload[8:12].decode("latin-1", "replace")
+            return None
+        if box_type in CONTAINER_BOXES:
+            found = _find_handler_type(fp, offset + header_size, offset + size, depth + 1)
+            if found:
+                return found
+        offset += size
+    return None
+
+
+def detect_media_kind(path):
+    """判断 .m4s 是视频流还是音频流，返回 'video' / 'audio' / None（无法判定）。"""
+    try:
+        end = path.stat().st_size
+        with open(path, "rb") as fp:
+            # 0 = 已剥头的文件；9 = B站原始缓存文件
+            for start in (0, BILIBILI_PREFIX_BYTES):
+                if start >= end:
+                    continue
+                handler = _find_handler_type(fp, start, end)
+                if handler == "vide":
+                    return "video"
+                if handler == "soun":
+                    return "audio"
+    except OSError:
+        return None
+    return None
+
+
+def split_audio_video(files):
+    """把两个 .m4s 分派成 (音频文件, 视频文件)。"""
+    kinds = {f: detect_media_kind(f) for f in files}
+    audio = [f for f in files if kinds[f] == "audio"]
+    video = [f for f in files if kinds[f] == "video"]
+    if len(audio) == 1 and len(video) == 1:
+        return audio[0], video[0]
+    # 内容判定失败时退回体积比较：B站缓存中视频流远大于音频流
+    print("警告：无法从文件内容判定音视频流类型，改按体积区分（较大者视为视频）。")
+    ordered = sorted(files, key=lambda f: (f.stat().st_size, f.name))
+    return ordered[0], ordered[1]
 
 def get_custom_name_from_video_info(work_dir: Path) -> str:
     """
@@ -94,33 +175,35 @@ def process_m4s_files(work_dir: Path, target_dir: Path, raise_on_error: bool = T
                 sys.exit(1)
             return False
 
-        # 按文件名排序（字典序）
-        m4s_files.sort(key=lambda f: f.name)
-        smaller, larger = m4s_files[0], m4s_files[1]
+        # 按实际流类型分派音视频（不能用文件名排序推断）
+        audio_src, video_src = split_audio_video(m4s_files)
 
         # 2. 辅助函数：删除前9字节
         def strip_first_9_bytes(src: Path, dst: Path):
             with open(src, 'rb') as fin:
                 data = fin.read()
-            if len(data) < 9:
-                print(f"警告：文件 {src.name} 大小不足 9 字节，删除后将变为空文件。")
+            if len(data) < BILIBILI_PREFIX_BYTES:
+                print(f"警告：文件 {src.name} 大小不足 {BILIBILI_PREFIX_BYTES} 字节，删除后将变为空文件。")
                 content = b''
             else:
-                content = data[9:]
+                content = data[BILIBILI_PREFIX_BYTES:]
             with open(dst, 'wb') as fout:
                 fout.write(content)
             print(f"已处理：{src.name} -> {dst.name} (删除前9字节)")
 
         audio_path = work_dir / "audio.m4s"
         video_path = work_dir / "video.m4s"
-        strip_first_9_bytes(smaller, audio_path)
-        strip_first_9_bytes(larger, video_path)
+        strip_first_9_bytes(audio_src, audio_path)
+        strip_first_9_bytes(video_src, video_path)
         print(f"完成前9字节删除，处理目录：{work_dir}")
 
         # 3. ffmpeg 合并
+        # 显式指定流映射：视频取自 video.m4s、音频取自 audio.m4s。
+        # 不依赖 ffmpeg 的自动流选择——自动选择恰好掩盖了音视频被错标的问题。
         output_mp4 = work_dir / "output.mp4"
         ffmpeg_cmd = [
             "ffmpeg", "-i", str(video_path), "-i", str(audio_path),
+            "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "copy", "-c:a", "aac", "-strict", "experimental",
             "-y", str(output_mp4)
         ]
@@ -232,7 +315,7 @@ def main():
     # 显示提示信息（包含多线程说明）
     print("此文件用于将 B 站（bilibili.com）本地缓存的 .m4s 文件转换为可播放的 mp4 文件。")
     print("处理逻辑：")
-    print("  1. 在每个缓存目录中找到两个 .m4s 文件（视频流和音频流），删除其前 9 字节头部；")
+    print("  1. 在每个缓存目录中找到两个 .m4s 文件，按文件内容识别出视频流与音频流，各自删除前 9 字节头部；")
     print("  2. 调用 ffmpeg 合并为 output.mp4；")
     print("  3. 根据 videoInfo.json 中的 tabName 和 up 主名称生成最终文件名；")
     print("  4. 将 mp4 文件移动到脚本执行目录。")
