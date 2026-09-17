@@ -229,6 +229,18 @@ def read_video_info(work_dir: Path):
         return None
 
 
+def as_text(value) -> str:
+    """
+    把 videoInfo.json 中的字段统一转成去掉首尾空白的字符串。
+
+    B站写入的 JSON 里，groupId 是数字（如 9291858），而 groupTitle、tabName、
+    uname 是字符串；直接对数字调用 .strip() 会抛 AttributeError。
+    """
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
 def get_series_key(info):
     """
     取视频所属系列的标识。B站把同一合集/多P视频的 groupId 设为相同值，
@@ -237,10 +249,10 @@ def get_series_key(info):
     """
     if not info:
         return None
-    group_id = (info.get("groupId") or "").strip()
+    group_id = as_text(info.get("groupId"))
     if group_id:
         return f"id:{group_id}"
-    group_title = (info.get("groupTitle") or "").strip()
+    group_title = as_text(info.get("groupTitle"))
     if group_title:
         return f"title:{group_title}"
     return None
@@ -253,8 +265,8 @@ def flat_base_name(work_dir: Path, info) -> str:
     if not info:
         print(f"警告：{work_dir / 'videoInfo.json'} 不可用，使用目录名作为文件名基础。")
         return sanitize_filename(work_dir.name)
-    tab_name = (info.get("tabName") or "").strip()
-    uname = (info.get("uname") or "").strip() or UNKNOWN_UP_NAME
+    tab_name = as_text(info.get("tabName"))
+    uname = as_text(info.get("uname")) or UNKNOWN_UP_NAME
     if not tab_name:
         # 如果没有 tabName，只用目录名
         return sanitize_filename(work_dir.name)
@@ -311,15 +323,15 @@ def build_output_plans(work_dirs, target_dir: Path):
             duration = None
         if len(members) >= 2:
             # 系列目录名 = 系列名称-up主名称
-            group_title = (info.get("groupTitle") or "").strip()
-            uname = (info.get("uname") or "").strip() or UNKNOWN_UP_NAME
+            group_title = as_text(info.get("groupTitle"))
+            uname = as_text(info.get("uname")) or UNKNOWN_UP_NAME
             if group_title:
                 series_dir = sanitize_filename(f"{group_title}-{uname}")
             else:
                 # 没有系列名称时退化为 up主名称，保证仍能分组
                 series_dir = sanitize_filename(f"{uname}-合集")
             # 系列内的视频只用视频名称，不追加 up主名称
-            tab_name = (info.get("tabName") or "").strip()
+            tab_name = as_text(info.get("tabName"))
             base_name = sanitize_filename(tab_name) if tab_name else sanitize_filename(d.name)
             plans[d] = OutputPlan(target_dir / series_dir, base_name, series_dir, duration)
         else:
