@@ -296,6 +296,8 @@ def build_output_plans(work_dirs, target_dir: Path):
     名称（tabName）。其余视频维持原有行为：直接放在 target_dir，文件名为
     "tabName by uname"。
 
+    规划完成后会调用 disambiguate_base_names() 消解同批次内的重名。
+
     参数:
         work_dirs: 本批次要处理的缓存目录列表
         target_dir: 最终 mp4 的根存放目录
@@ -336,7 +338,52 @@ def build_output_plans(work_dirs, target_dir: Path):
             plans[d] = OutputPlan(target_dir / series_dir, base_name, series_dir, duration)
         else:
             plans[d] = OutputPlan(target_dir, flat_base_name(d, info), "", duration)
+
+    disambiguate_base_names(plans, infos)
     return plans
+
+
+def disambiguate_base_names(plans, infos):
+    """
+    消解同一批次内的输出重名，名字只取决于视频自身信息，与处理顺序无关。
+
+    系列内的视频只用分P标签（tabName）命名，但整个系列的分P标签往往完全相同
+    （实测一个合集里三个视频的 tabName 都是「正片」），于是只能靠 _1、_2 后缀
+    区分，而该后缀取决于并行转换完成的先后顺序，跨次运行不稳定，也无法从文件名
+    看出内容。这里在生成前统一改名：
+
+    1. 重名的视频改用视频标题（title）；
+    2. 仍然重名时追加分P序号（p），必要时退回目录名（cid）。
+
+    仅在出现重名时改名，不重名的视频保持原有命名。
+    """
+    def base_from_label(work_dir, label):
+        """按该视频是否属于系列，套用与 build_output_plans 一致的命名规则。"""
+        if plans[work_dir].series_dir:
+            return sanitize_filename(label)
+        uname = as_text((infos[work_dir] or {}).get("uname")) or UNKNOWN_UP_NAME
+        return sanitize_filename(f"{label} by {uname}")
+
+    def collision_groups():
+        """返回当前规划中所有「同一目录下同名」的成员列表。"""
+        groups = {}
+        for work_dir, plan in plans.items():
+            groups.setdefault((plan.dest_dir, plan.base_name), []).append(work_dir)
+        return [members for members in groups.values() if len(members) > 1]
+
+    # 第一轮：改用视频标题，让文件名能反映内容
+    for members in collision_groups():
+        for work_dir in members:
+            title = as_text((infos[work_dir] or {}).get("title"))
+            if title:
+                plans[work_dir].base_name = base_from_label(work_dir, title)
+
+    # 第二轮：标题仍重名时追加分P序号，保证确定性且不互相覆盖
+    for members in collision_groups():
+        for work_dir in members:
+            info = infos[work_dir] or {}
+            suffix = as_text(info.get("p")) or as_text(info.get("itemId")) or work_dir.name
+            plans[work_dir].base_name = f"{plans[work_dir].base_name}-P{suffix}"
 
 
 def describe_plans(plans, target_dir: Path):
