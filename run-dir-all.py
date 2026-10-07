@@ -307,11 +307,27 @@ def get_series_key(info):
     return None
 
 
+def author_suffix(info) -> str:
+    """
+    文件名尾部的「 by up主名称」。
+
+    只有直接放在输出根目录的视频才追加这个后缀；系列目录名里已经带了 up 主名称，
+    目录内的文件就不再重复。up 主名称缺失或本身是占位词时返回空字符串（不加后缀）。
+    """
+    if not info:
+        return ""
+    uname = as_text(info.get("uname"))
+    if not uname or is_invalid_name_part(uname):
+        return ""
+    return f" by {sanitize_filename(uname)}"
+
+
 def flat_base_name(work_dir: Path, info) -> str:
     """
     非系列视频的文件名基础："groupTitle - title - tabName"。
     三者一致的片段只保留一次；含「正片」等无效表达的片段被忽略。
     读不到 videoInfo.json、或所有片段都无效时，退回目录名。
+    尾部「 by up主名称」由 author_suffix() 在消解重名之后再追加。
     """
     if not info:
         print(f"警告：{work_dir / 'videoInfo.json'} 不可用，使用目录名作为文件名基础。")
@@ -329,6 +345,7 @@ class OutputPlan:
     base_name: str                    # 不含扩展名的文件名
     series_dir: str = ""              # 系列目录名；为空表示该视频不属于多视频系列
     expected_duration: float = None   # videoInfo.json 声明的时长（秒），用于校验已有文件
+    author: str = ""                  # 文件名尾部后缀（" by up主名称"）；空表示不追加
 
     @property
     def planned_path(self) -> Path:
@@ -343,10 +360,12 @@ def build_output_plans(work_dirs, target_dir: Path):
     同一系列（videoInfo.json 中 groupId 相同）在本批次中出现 2 个及以上视频时，
     这些视频统一放进 target_dir/{系列名称}-{up主名称}/ 子目录，文件名只用视频标题
     （title）。其余视频直接放在 target_dir，文件名为
-    "groupTitle - title - tabName"——重复片段只保留一次，含「正片」等无效表达的
-    片段会被剔除。
+    "groupTitle - title - tabName by up主名称"——重复片段只保留一次，含「正片」等
+    无效表达的片段会被剔除。
 
-    规划完成后会调用 disambiguate_base_names() 消解同批次内的重名。
+    规划完成后会调用 disambiguate_base_names() 消解同批次内的重名，最后才给直接
+    放在 target_dir 的文件补上「 by up主名称」（系列目录内的文件不加，因为目录名
+    已经带了 up 主名称）。
 
     参数:
         work_dirs: 本批次要处理的缓存目录列表
@@ -388,9 +407,15 @@ def build_output_plans(work_dirs, target_dir: Path):
             base_name = sanitize_filename(label) if label else sanitize_filename(d.name)
             plans[d] = OutputPlan(target_dir / series_dir, base_name, series_dir, duration)
         else:
-            plans[d] = OutputPlan(target_dir, flat_base_name(d, info), "", duration)
+            plans[d] = OutputPlan(target_dir, flat_base_name(d, info), "", duration,
+                                  author_suffix(info))
 
     disambiguate_base_names(plans, infos)
+
+    # 重名消解完毕后再补 up 主后缀，避免「标题 by UP主-P7」这种错位写法
+    for plan in plans.values():
+        if plan.author:
+            plan.base_name = f"{plan.base_name}{plan.author}"
     return plans
 
 
@@ -714,10 +739,12 @@ def main():
     print("  2. 调用 ffmpeg 合并为 output.mp4；")
     print("  3. 按「系列名称 - 视频标题 - 分P标签」生成最终文件名，")
     print("     三者相同的片段只保留一次，含「正片」等无效表达的片段会被忽略；")
-    print("  4. 将 mp4 文件移动到脚本执行目录。")
+    print("  4. 直接输出到脚本执行目录的文件，文件名末尾追加「 by up主名称」；")
+    print("  5. 将 mp4 文件移动到脚本执行目录。")
     print("\n文件名示例：")
-    print("  groupTitle、title、tabName 三者一致时 -> 「先问各位程序员们……路线图？」")
-    print("  tabName 是占位词「正片」时           -> 「心理进化论 - 在公共场合和人起冲突……」")
+    print("  groupTitle、title、tabName 三者一致时 -> 「先问各位程序员们……路线图？ by 某某UP」")
+    print("  tabName 是占位词「正片」时           -> 「心理进化论 - 在公共场合和人起冲突…… by 某某UP」")
+    print("  系列目录内（目录名已含 up 主名称）   -> 「第一讲.mp4」（不加后缀）")
     print("\n避免重复生成：")
     print("  - 生成前先预判目标位置与文件名；")
     print("  - 若该文件已存在且校验通过（体积正常、含视频流与音频流、时长与")
@@ -727,7 +754,7 @@ def main():
     print("\n系列视频处理：")
     print("  - 同一系列的多个视频（videoInfo.json 中 groupId 相同的缓存目录），")
     print("    会统一放进一个子目录，目录名为「系列名称-up主名称」；")
-    print("  - 系列目录内的视频文件只使用视频标题（title）；")
+    print("  - 系列目录内的视频文件只使用视频标题（title），不再追加 up 主名称；")
     print("  - 系列内只有一个视频时不建子目录，其余视频也直接放在脚本执行目录。")
     print("\n多线程支持：")
     print("  - 当处理多个目录时（无参数自动扫描数字目录，或显式传入多个目录参数），")
